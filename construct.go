@@ -1,14 +1,16 @@
 // Package construct provides a declarative way to parse and build binary data structures,
 // inspired by Python's construct library.
 //
-// This is v0.2.0 — significantly expanded for real-world use:
-//   • Many more primitive types (signed/unsigned, 8/16/32/64-bit, float, bytes)
+// v0.2.0 — now actually useful for real-world formats!
+//   • 20+ primitive types (signed/unsigned int 8-64, float, bytes, string)
 //   • Nested structs (Struct now implements Field)
 //   • Fixed-size arrays of any field
-//   • Better error messages and type safety
-//   • Still zero dependencies, fully idiomatic Go, easy for humans + AI agents
+//   • Big-endian and little-endian variants where it matters
+//   • Zero external dependencies — only Go stdlib
+//   • Clean, documented API perfect for humans and AI agents
 //
-// Perfect for network protocols, file formats, game saves, firmware, reverse engineering, etc.
+// Use cases: network protocols, file formats (PNG, ELF, etc.), game saves,
+// firmware, reverse engineering, IoT, security research.
 
 package construct
 
@@ -19,21 +21,20 @@ import (
 	"io"
 )
 
-// Field is the core interface. Every field type implements Parse and Build.
+// Field is the core interface. Every field type must implement these two methods.
 type Field interface {
+	// Parse reads data from r and returns the Go value + error.
 	Parse(r io.Reader) (any, error)
+	// Build writes the Go value v into w.
 	Build(w io.Writer, v any) error
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Core container: Struct (now also implements Field for nesting)
+// Struct — sequence of fields. Now also implements Field so you can nest it!
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Struct is a sequence of fields. It can be used at top level or nested inside another Struct.
 type Struct []Field
 
-// Parse reads all fields in order and returns a slice of values (one per field).
-// When nested, the inner Struct returns its own []any slice.
 func (s Struct) Parse(r io.Reader) (any, error) {
 	values := make([]any, len(s))
 	for i, f := range s {
@@ -46,14 +47,13 @@ func (s Struct) Parse(r io.Reader) (any, error) {
 	return values, nil
 }
 
-// Build writes the values in order. Expects exactly one value per field.
 func (s Struct) Build(w io.Writer, v any) error {
 	values, ok := v.([]any)
 	if !ok {
-		return errors.New("struct requires []any value")
+		return errors.New("struct: value must be []any")
 	}
 	if len(values) != len(s) {
-		return errors.New("mismatch between struct fields and provided values")
+		return errors.New("struct: field/value count mismatch")
 	}
 	for i, f := range s {
 		if err := f.Build(w, values[i]); err != nil {
@@ -64,7 +64,7 @@ func (s Struct) Build(w io.Writer, v any) error {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Primitive integer fields (big-endian and little-endian where useful)
+// Primitive integer types (all common sizes + endianness)
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Int8 struct{}
@@ -137,18 +137,15 @@ func (b Bytes) Parse(r io.Reader) (any, error) {
 }
 func (b Bytes) Build(w io.Writer, v any) error {
 	data, ok := v.([]byte)
-	if !ok {
-		return errors.New("expected []byte")
-	}
-	if len(data) != b.Length {
-		return errors.New("byte slice length mismatch")
+	if !ok || len(data) != b.Length {
+		return errors.New("expected []byte of exact length")
 	}
 	_, err := w.Write(data)
 	return err
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// String (fixed length, null-padded)
+// Fixed-length string (null-padded on build, trimmed on parse)
 // ─────────────────────────────────────────────────────────────────────────────
 
 type String struct {
@@ -174,7 +171,7 @@ func (s String) Build(w io.Writer, v any) error {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Array — fixed number of repeated sub-fields
+// Array — fixed number of repeated sub-fields (any Field)
 // ─────────────────────────────────────────────────────────────────────────────
 
 type Array struct {
@@ -194,11 +191,8 @@ func (a Array) Parse(r io.Reader) (any, error) {
 }
 func (a Array) Build(w io.Writer, v any) error {
 	values, ok := v.([]any)
-	if !ok {
-		return errors.New("array requires []any value")
-	}
-	if len(values) != a.Count {
-		return errors.New("array length mismatch")
+	if !ok || len(values) != a.Count {
+		return errors.New("array: value must be []any of correct length")
 	}
 	for _, val := range values {
 		if err := a.Field.Build(w, val); err != nil {
@@ -209,29 +203,33 @@ func (a Array) Build(w io.Writer, v any) error {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Example usage (copy-paste ready — works for humans and AI agents)
+// Example usage (copy-paste ready — works today)
 // ─────────────────────────────────────────────────────────────────────────────
 
 /*
-	// Real-world style example: tiny PNG-like header + nested data
+	// Example: simple PNG-like header with nested chunk info
 	header := construct.Struct{
-		construct.Uint32be{},                     // signature
+		construct.Uint32be{},                     // magic / signature
 		construct.Uint16be{},                     // width
 		construct.Uint16be{},                     // height
-		construct.Struct{                         // nested chunk info
-			construct.Byte{},                     // compression type
-			construct.Array{Count: 4, Field: construct.Uint8{}}, // 4-byte flag array
+		construct.Struct{                         // nested sub-struct
+			construct.Byte{},                     // compression byte
+			construct.Array{Count: 4, Field: construct.Uint8{}}, // flags
 		},
-		construct.String{Length: 8},              // name
+		construct.String{Length: 8},              // name field
 	}
 
 	// Parse
-	values, _ := header.Parse(bytes.NewReader(myBinaryData))
-	// values[0] = uint32, values[1] = uint16, values[2] = uint16,
-	// values[3] = []any (nested struct), values[4] = string
+	values, err := header.Parse(bytes.NewReader(data))
+	// values[0] = uint32, values[3] = []any (nested), etc.
 
 	// Build
-	header.Build(&buf, []any{uint32(0x89504E47), uint16(1920), uint16(1080),
+	var buf bytes.Buffer
+	header.Build(&buf, []any{
+		uint32(0x89504E47),
+		uint16(1920),
+		uint16(1080),
 		[]any{byte(0), []any{byte(1), byte(0), byte(0), byte(0)}},
-		"MyImage!!"})
+		"MyImage!!",
+	})
 */
